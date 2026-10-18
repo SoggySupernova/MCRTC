@@ -1,3 +1,5 @@
+DISCLAIMER: this is vibecoded and intended for personal use. Do not use this in production!
+
 # mctunnel
 
 Bare-bones WebRTC TCP tunnel for Minecraft (Java) with copy/paste signaling.
