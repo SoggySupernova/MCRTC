@@ -22,6 +22,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -33,10 +35,11 @@ var (
 	target     = flag.String("target", "127.0.0.1:25565", "host: TCP address to forward tunnel connections to")
 	listen     = flag.String("listen", "127.0.0.1:25565", "client: local address to listen on")
 	stunURLs   = flag.String("stun", "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478", "comma-separated STUN URLs (empty to disable)")
-	turnURLs   = flag.String("turn", "turn:staticauth.openrelay.metered.ca:80,turn:staticauth.openrelay.metered.ca:80?transport=tcp,turn:staticauth.openrelay.metered.ca:443,turns:staticauth.openrelay.metered.ca:443?transport=tcp", "comma-separated TURN URLs (empty to disable)")
-	turnSecret = flag.String("turn-secret", "openrelayprojectsecret", "TURN shared secret (REST-style time-limited credentials)")
-	turnUser   = flag.String("turn-user", "", "static TURN username (overrides -turn-secret)")
-	turnPass   = flag.String("turn-pass", "", "static TURN password (overrides -turn-secret)")
+	turnURLs   = flag.String("turn", "", "comma-separated TURN URLs (default: none, i.e. direct connections only)")
+	turnSecret = flag.String("turn-secret", "", "optional TURN shared secret: generates time-limited credentials and overrides -turn-user/-turn-pass")
+	turnUser   = flag.String("turn-user", "", "TURN username")
+	turnPass   = flag.String("turn-pass", "", "TURN password")
+	turnConfig = flag.String("turn-config", "", "path to a JSON file listing TURN servers, each with its own credentials (see turn-servers.example.json)")
 	relayOnly  = flag.Bool("relay-only", false, "only use TURN relay candidates (to test the relay path)")
 )
 
@@ -45,6 +48,13 @@ var stdin = bufio.NewReaderSize(os.Stdin, 1<<20)
 func main() {
 	flag.Parse()
 	log.SetFlags(log.Ltime)
+	if *turnConfig != "" {
+		extra, err := loadServers(*turnConfig)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("loaded %d TURN/STUN server entries from %s", len(extra), *turnConfig)
+	}
 	switch *mode {
 	case "host":
 		runHost()
@@ -71,7 +81,7 @@ func iceConfig() webrtc.Configuration {
 	}
 	if t := splitList(*turnURLs); len(t) > 0 {
 		user, pass := *turnUser, *turnPass
-		if user == "" {
+		if *turnSecret != "" {
 			// TURN REST API style: username = expiry timestamp, password = HMAC-SHA1(secret, username)
 			user = fmt.Sprintf("%d", time.Now().Add(24*time.Hour).Unix())
 			m := hmac.New(sha1.New, []byte(*turnSecret))
@@ -79,6 +89,13 @@ func iceConfig() webrtc.Configuration {
 			pass = base64.StdEncoding.EncodeToString(m.Sum(nil))
 		}
 		servers = append(servers, webrtc.ICEServer{URLs: t, Username: user, Credential: pass})
+	}
+	if *turnConfig != "" {
+		if extra, err := loadServers(*turnConfig); err != nil {
+			log.Printf("ignoring -turn-config: %v", err)
+		} else {
+			servers = append(servers, extra...)
+		}
 	}
 	cfg := webrtc.Configuration{ICEServers: servers}
 	if *relayOnly {
@@ -113,6 +130,45 @@ func splitList(s string) []string {
 	return out
 }
 
+// serverEntry is one object in the -turn-config JSON file.
+type serverEntry struct {
+	URLs       json.RawMessage `json:"urls"` // a string or a list of strings
+	Username   string          `json:"username"`
+	Credential string          `json:"credential"`
+}
+
+func loadServers(path string) ([]webrtc.ICEServer, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var entries []serverEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, fmt.Errorf("%s: expected a JSON list of server objects: %w", path, err)
+	}
+	var out []webrtc.ICEServer
+	for i, e := range entries {
+		var urls []string
+		if err := json.Unmarshal(e.URLs, &urls); err != nil {
+			var one string
+			if err2 := json.Unmarshal(e.URLs, &one); err2 != nil {
+				return nil, fmt.Errorf("%s: entry %d: \"urls\" must be a string or a list of strings", path, i+1)
+			}
+			urls = []string{one}
+		}
+		if len(urls) == 0 {
+			return nil, fmt.Errorf("%s: entry %d: \"urls\" is empty", path, i+1)
+		}
+		for _, u := range urls {
+			if strings.HasPrefix(u, "turn") && (e.Username == "" || e.Credential == "") {
+				return nil, fmt.Errorf("%s: entry %d: %s needs \"username\" and \"credential\"", path, i+1, u)
+			}
+		}
+		out = append(out, webrtc.ICEServer{URLs: urls, Username: e.Username, Credential: e.Credential})
+	}
+	return out, nil
+}
+
 // gather waits for ICE candidates (non-trickle) so the blob contains everything.
 func gather(pc *webrtc.PeerConnection) webrtc.SessionDescription {
 	done := webrtc.GatheringCompletePromise(pc)
@@ -121,24 +177,68 @@ func gather(pc *webrtc.PeerConnection) webrtc.SessionDescription {
 	case <-time.After(10 * time.Second):
 		log.Println("ICE gathering timed out, continuing with candidates found so far")
 	}
+	sdp := pc.LocalDescription().SDP
+	log.Printf("gathered candidates: host=%d srflx=%d relay=%d",
+		strings.Count(sdp, " typ host"), strings.Count(sdp, " typ srflx"), strings.Count(sdp, " typ relay"))
+	if *relayOnly && strings.Count(sdp, " typ relay") == 0 {
+		log.Println("WARNING: -relay-only but no relay candidates were gathered: the TURN server is unreachable or rejected the credentials, so this cannot connect")
+	}
 	return *pc.LocalDescription()
 }
 
-// ---------- copy/paste signaling ----------
+// ---------- terminal styling (plain text when piped or NO_COLOR is set) ----------
 
-func encode(d webrtc.SessionDescription) string {
+var useColor = func() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}()
+
+func style(code, s string) string {
+	if !useColor {
+		return s
+	}
+	return "\x1b[" + code + "m" + s + "\x1b[0m"
+}
+
+// OFFER is cyan, ANSWER is yellow, so the two are never confused.
+func kindStyle(kind string) string {
+	if kind == "OFFER" {
+		return "1;36"
+	}
+	return "1;33"
+}
+
+// ---------- copy/paste signaling ----------
+//
+// Blobs look like MCT.OFFER.<url-safe base64> or MCT.ANSWER.<...> (no '=' padding, no
+// spaces). The prefix says which kind it is, and the parser pulls the blob out of
+// whatever text was pasted, so stray surrounding text is harmless.
+
+var blobRe = regexp.MustCompile(`MCT\.(OFFER|ANSWER)\.[A-Za-z0-9_-]+`)
+
+func encode(kind string, d webrtc.SessionDescription) string {
 	j, _ := json.Marshal(d)
 	var b bytes.Buffer
 	zw := gzip.NewWriter(&b)
 	zw.Write(j)
 	zw.Close()
-	return base64.StdEncoding.EncodeToString(b.Bytes())
+	return "MCT." + kind + "." + base64.RawURLEncoding.EncodeToString(b.Bytes())
 }
 
-func decode(s string) (webrtc.SessionDescription, error) {
+func decode(kind, text string) (webrtc.SessionDescription, error) {
 	var d webrtc.SessionDescription
-	s = strings.Join(strings.Fields(s), "")
-	raw, err := base64.StdEncoding.DecodeString(s)
+	m := blobRe.FindString(text)
+	if m == "" {
+		return d, fmt.Errorf("no MCT.%s.... blob found in what you pasted", kind)
+	}
+	parts := strings.SplitN(m, ".", 3)
+	if parts[1] != kind {
+		return d, fmt.Errorf("that is an %s, but an %s is needed here", parts[1], kind)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
 		return d, err
 	}
@@ -153,25 +253,51 @@ func decode(s string) (webrtc.SessionDescription, error) {
 	return d, json.Unmarshal(j, &d)
 }
 
-func prompt(msg string) webrtc.SessionDescription {
+// prompt asks for a blob of the given kind ("OFFER" or "ANSWER") and retries until it parses.
+func prompt(kind, msg string) webrtc.SessionDescription {
 	for {
-		fmt.Printf("\n%s\n> ", msg)
+		fmt.Printf("\n%s %s\n%s ", style(kindStyle(kind), "▶ PASTE HERE:"), style("1", msg), style("2", "›"))
 		line, err := stdin.ReadString('\n')
 		if err != nil && strings.TrimSpace(line) == "" {
 			log.Fatalf("stdin closed: %v", err)
 		}
-		d, derr := decode(line)
+		d, derr := decode(kind, line)
 		if derr != nil {
-			fmt.Printf("could not parse that (%v). Paste the whole blob on one line.\n", derr)
+			fmt.Printf("%s %v. Try again.\n", style("1;31", "✗"), derr)
 			continue
 		}
 		return d
 	}
 }
 
-func show(label string, d webrtc.SessionDescription) {
-	b := encode(d)
-	fmt.Printf("\n>>> BEGIN %s (%d chars): copy only the line below this one >>>\n\n%s\n\n<<< END %s: do not copy this line <<<\n", label, len(b), b, label)
+func toClipboard(text string) bool {
+	for _, c := range [][]string{{"pbcopy"}, {"wl-copy"}, {"xclip", "-selection", "clipboard"}, {"xsel", "-b", "-i"}} {
+		if _, err := exec.LookPath(c[0]); err != nil {
+			continue
+		}
+		cmd := exec.Command(c[0], c[1:]...)
+		cmd.Stdin = strings.NewReader(text)
+		if cmd.Run() == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func show(kind string, d webrtc.SessionDescription) {
+	b := encode(kind, d)
+	st := kindStyle(kind)
+	rule := strings.Repeat("━", 64)
+	fmt.Printf("\n%s\n", style(st, "┏"+rule))
+	fmt.Printf("%s  %s\n", style(st, "┃"), style("1", fmt.Sprintf("YOUR %s is ready (%d chars)", kind, len(b))))
+	fmt.Printf("%s  Send the single MCT line below to the other person.\n", style(st, "┃"))
+	fmt.Printf("%s  It starts with %s and has no spaces.\n", style(st, "┃"), style("1", "MCT."+kind+"."))
+	fmt.Printf("%s\n\n", style(st, "┣"+rule))
+	fmt.Printf("%s\n\n", style(st, b))
+	fmt.Printf("%s\n", style(st, "┗"+rule))
+	if toClipboard(b) {
+		fmt.Printf("%s copied to your clipboard\n", style("1;32", "✓"))
+	}
 }
 
 // ---------- byte pump ----------
@@ -235,7 +361,7 @@ func runHost() {
 			})
 		})
 
-		offer := prompt(fmt.Sprintf("Paste the OFFER from peer %d:", id))
+		offer := prompt("OFFER", fmt.Sprintf("Paste the OFFER from peer %d, then press Enter:", id))
 		if err := pc.SetRemoteDescription(offer); err != nil {
 			log.Printf("bad offer: %v", err)
 			pc.Close()
@@ -250,7 +376,6 @@ func runHost() {
 			log.Fatal(err)
 		}
 		show("ANSWER", gather(pc))
-		fmt.Println("Waiting for the connection; you can paste another peer's offer below at any time.")
 	}
 }
 
@@ -293,7 +418,7 @@ func runClient() {
 	}
 	show("OFFER", gather(pc))
 
-	answer := prompt("Paste the ANSWER from the host:")
+	answer := prompt("ANSWER", "Paste the ANSWER from the host, then press Enter:")
 	if err := pc.SetRemoteDescription(answer); err != nil {
 		log.Fatal(err)
 	}
