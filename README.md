@@ -1,33 +1,28 @@
 DISCLAIMER: this is vibecoded and intended for personal use. Do not use this in production!
 
-# mctunnel
+# MCRTC
 
 Bare-bones WebRTC TCP tunnel for Minecraft (Java) with copy/paste signaling.
 Untested as shipped: it has not been compiled or run yet.
 
 ## Build (needs Go 1.22+ and internet access for the first build)
 
-    mkdir mctunnel && cd mctunnel        # put main.go and go.mod here
     go mod tidy                          # downloads pion/webrtc
-    go build -o mctunnel .                                         # Linux
-    GOOS=darwin GOARCH=arm64 go build -o mctunnel-mac-arm64 .      # Apple Silicon
-    GOOS=darwin GOARCH=amd64 go build -o mctunnel-mac-intel .      # Intel Mac
+    go build -o mcrtc .            # don't forget the dot there!
 
 ## Run
 
-Host (you, Linux), with the Minecraft server already running on 25565:
+Host, with the Minecraft server already running on port 25565:
 
-    ./mctunnel -mode host
+    ./mcrtc -mode host
 
-Client (friend, macOS):
+Client:
 
-    chmod +x mctunnel-mac-arm64
-    xattr -d com.apple.quarantine mctunnel-mac-arm64   # only if downloaded via browser
-    ./mctunnel-mac-arm64 -mode client
+    ./mcrtc -mode client
 
 Handshake:
-1. Client prints an OFFER (one line starting `MCT.OFFER.`; also copied to the clipboard when possible). Friend sends it to you (Discord, etc.).
-2. Paste it into the host prompt. Host prints an ANSWER (`MCT.ANSWER.`).
+1. Client prints an OFFER (one line starting `MCRTC.OFFER.`; also copied to the clipboard when possible). Friend sends it to you (Discord, etc.).
+2. Paste it into the host prompt. Host prints an ANSWER (`MCRTC.ANSWER.`).
 3. Send the ANSWER back; friend pastes it into the client prompt.
 4. Client prints "tunnel up". Friend adds `localhost` (port 25565) in Minecraft.
 
